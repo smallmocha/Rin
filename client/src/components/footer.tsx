@@ -59,7 +59,7 @@ function Footer() {
                             setDoubleClickTimes(doubleClickTimes + 1)
                         }
                     }}>
-                        © {new Date().getFullYear()} Powered by{' '} <a className='hover:underline' href="https://github.com/openRin/Rin" target="_blank">Rin</a>
+                        © {new Date().getFullYear()} {' '} <a className='hover:underline' href="https://blog.coderocku.com" target="_blank">CoderockU</a> All Rights Reserved. 版权所有.
                     </span>
                     {config.get<boolean>('rss') && <>
                         <Spliter />
