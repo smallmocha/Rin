@@ -1,14 +1,14 @@
-import {and, asc, count, desc, eq, gt, like, lt, or} from "drizzle-orm";
-import Elysia, {t} from "elysia";
-import {XMLParser} from "fast-xml-parser";
+import { and, asc, count, desc, eq, gt, like, lt, or, sql } from "drizzle-orm";
+import Elysia, { t } from "elysia";
+import { XMLParser } from "fast-xml-parser";
 import html2md from 'html-to-md';
-import type {DB} from "../_worker";
-import {feeds, visits} from "../db/schema";
-import {setup} from "../setup";
-import {ClientConfig, PublicCache} from "../utils/cache";
-import {getDB} from "../utils/di";
-import {extractImage} from "../utils/image";
-import {bindTagToPost} from "./tag";
+import type { DB } from "../_worker";
+import { feeds, visits } from "../db/schema";
+import { setup } from "../setup";
+import { ClientConfig, PublicCache } from "../utils/cache";
+import { getDB } from "../utils/di";
+import { extractImage } from "../utils/image";
+import { bindTagToPost } from "./tag";
 
 export function FeedService() {
     const db: DB = getDB();
@@ -200,12 +200,12 @@ export function FeedService() {
                             feedId: feed.id,
                             ip: ip,
                         });
-                        const visit = await db.query.visits.findMany({
-                            where: eq(visits.feedId, feed.id),
-                            columns: { id: true, ip: true }
-                        });
-                        pv = visit.length;
-                        uv = new Set(visit.map((v) => v.ip)).size;
+                        const visitStats = await db.select({
+                            pv: count(),
+                            uv: sql<number>`count(distinct ${visits.ip})`
+                        }).from(visits).where(eq(visits.feedId, feed.id));
+                        pv = visitStats[0].pv;
+                        uv = visitStats[0].uv;
                     }
                     const data = {
                         ...other,
@@ -233,7 +233,7 @@ export function FeedService() {
 
                     const feed = await db.query.feeds.findFirst({
                         where: eq(feeds.id, id_num),
-                        columns: {createdAt: true},
+                        columns: { createdAt: true },
                     });
                     if (!feed) {
                         set.status = 404;
@@ -257,12 +257,12 @@ export function FeedService() {
                             // NOTE: feed.id is adjacent feed, id_num is current feed id
                             const cacheKey = `${feed.id}_${feedDirection}_${id_num}`;
                             const cacheData = {
-                            id: feed.id,
-                            title: feed.title,
-                            summary: summary,
-                            hashtags: hashtags_flatten,
-                            createdAt: feed.createdAt,
-                            updatedAt: feed.updatedAt,
+                                id: feed.id,
+                                title: feed.title,
+                                summary: summary,
+                                hashtags: hashtags_flatten,
+                                createdAt: feed.createdAt,
+                                updatedAt: feed.updatedAt,
                             };
                             cache.set(cacheKey, cacheData);
                             return cacheData;
@@ -440,6 +440,7 @@ export function FeedService() {
             const cache = PublicCache();
             const page_num = (page ? page > 0 ? page : 1 : 1) - 1;
             const limit_num = limit ? +limit > 50 ? 50 : +limit : 20;
+
             if (keyword === undefined || keyword.trim().length === 0) {
                 return {
                     size: 0,
@@ -447,57 +448,70 @@ export function FeedService() {
                     hasNext: false
                 }
             }
-            const cacheKey = `search_${keyword}`;
+
+            const cacheKey = `search_${keyword}_${page_num}_${limit_num}`;
+            const cached = await cache.get(cacheKey);
+            if (cached) {
+                return cached;
+            }
+
             const searchKeyword = `%${keyword}%`;
-            const whereClause = or(like(feeds.title, searchKeyword),
-                    like(feeds.content, searchKeyword),
+            const baseWhereClause = or(
+                like(feeds.title, searchKeyword),
+                like(feeds.content, searchKeyword),
                 like(feeds.summary, searchKeyword),
-                like(feeds.alias, searchKeyword));
-            const feed_list = (await cache.getOrSet(cacheKey, () => db.query.feeds.findMany({
-                where: admin ? whereClause : and(whereClause, eq(feeds.draft, 0)),
-                columns: admin ? undefined : {
-                    draft: false,
-                    listed: false
-                },
-                with: {
-                    hashtags: {
-                        columns: {},
-                        with: {
-                            hashtag: {
-                                columns: { id: true, name: true }
+                like(feeds.alias, searchKeyword)
+            );
+
+            const whereClause = admin ? baseWhereClause : and(baseWhereClause, eq(feeds.draft, 0));
+
+            const [total, feed_list_raw] = await Promise.all([
+                db.select({ count: count() }).from(feeds).where(whereClause),
+                db.query.feeds.findMany({
+                    where: whereClause,
+                    columns: admin ? undefined : {
+                        draft: false,
+                        listed: false
+                    },
+                    with: {
+                        hashtags: {
+                            columns: {},
+                            with: {
+                                hashtag: {
+                                    columns: { id: true, name: true }
+                                }
                             }
+                        },
+                        user: {
+                            columns: { id: true, username: true, avatar: true }
                         }
-                    }, user: {
-                        columns: { id: true, username: true, avatar: true }
-                    }
-                },
-                orderBy: [desc(feeds.createdAt), desc(feeds.updatedAt)],
-            }))).map(({ content, hashtags, summary, ...other }) => {
+                    },
+                    orderBy: [desc(feeds.createdAt), desc(feeds.updatedAt)],
+                    offset: page_num * limit_num,
+                    limit: limit_num
+                })
+            ]);
+
+            const size = total[0].count;
+            const feed_list = feed_list_raw.map(({ content, hashtags, summary, ...other }) => {
                 return {
                     summary: summary.length > 0 ? summary : content.length > 100 ? content.slice(0, 100) : content,
                     hashtags: hashtags.map(({ hashtag }) => hashtag),
                     ...other
                 }
             });
-            if (feed_list.length <= page_num * limit_num) {
-                return {
-                    size: feed_list.length,
-                    data: [],
-                    hasNext: false
-                }
-            } else if (feed_list.length <= page_num * limit_num + limit_num) {
-                return {
-                    size: feed_list.length,
-                    data: feed_list.slice(page_num * limit_num),
-                    hasNext: false
-                }
-            } else {
-                return {
-                    size: feed_list.length,
-                    data: feed_list.slice(page_num * limit_num, page_num * limit_num + limit_num),
-                    hasNext: true
-                }
-            }
+
+            const hasNext = (page_num + 1) * limit_num < size;
+
+            const result = {
+                size,
+                data: feed_list,
+                hasNext
+            };
+
+            await cache.set(cacheKey, result);
+
+            return result;
         }, {
             query: t.Object({
                 page: t.Optional(t.Numeric()),
